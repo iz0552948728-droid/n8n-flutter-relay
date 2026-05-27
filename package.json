@@ -1,0 +1,15 @@
+{
+  "name": "n8n-flutter-relay",
+  "version": "1.0.0",
+  "description": "WebSocket relay between n8n cloud and Flutter desktop app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
