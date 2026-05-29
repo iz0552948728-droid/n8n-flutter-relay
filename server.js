@@ -60,12 +60,20 @@ wss.on('connection', ws => {
       const msg = JSON.parse(data.toString());
 
       if (msg.type === 'answer' && msg.callback_url) {
-        console.log(`Answer received for ${msg.id}, forwarding to n8n...`);
-        await fetch(msg.callback_url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: msg.id, answer: msg.answer }),
-        });
+        console.log(`Forwarding answer "${msg.answer}" to: ${msg.callback_url}`);
+        try {
+          const r = await fetch(msg.callback_url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: msg.id, answer: msg.answer }),
+          });
+          const text = await r.text();
+          console.log(`n8n response: ${r.status} — ${text}`);
+          ws.send(JSON.stringify({ type: 'ack', id: msg.id, status: r.status, body: text }));
+        } catch (fetchErr) {
+          console.error(`Fetch error: ${fetchErr.message}`);
+          ws.send(JSON.stringify({ type: 'ack', id: msg.id, error: fetchErr.message }));
+        }
       }
     } catch (e) {
       console.error('Message error:', e.message);
