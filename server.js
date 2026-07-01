@@ -1,44 +1,42 @@
 const http = require('http');
 const WebSocket = require('ws');
 
-// clientId -> { ws, clientId, userId }
+// client_id -> { ws, clientId, userId }
 const clients = new Map();
 
 function sendToAll(payload) {
-  let sent = 0;
-  clients.forEach(({ ws }) => {
+  let sentClients = [];
+  clients.forEach(({ ws, clientId, userId }) => {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(payload));
-      sent++;
+      sentClients.push({ client_id: clientId, user_id: userId });
     }
   });
-  return sent;
+  return sentClients;
 }
 
 function sendToClientId(clientId, payload) {
   const entry = clients.get(clientId);
   if (entry && entry.ws.readyState === WebSocket.OPEN) {
     entry.ws.send(JSON.stringify(payload));
-    return 1;
+    return [{ client_id: entry.clientId, user_id: entry.userId }];
   }
-  return 0;
+  return [];
 }
 
 function sendToUserId(userId, payload) {
-  let sent = 0;
-  clients.forEach(({ ws, userId: uid }) => {
+  let sentClients = [];
+  clients.forEach(({ ws, clientId, userId: uid }) => {
     if (uid == userId && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(payload));
-      sent++;
+      sentClients.push({ client_id: clientId, user_id: uid });
     }
   });
-  return sent;
+  return sentClients;
 }
 
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Content-Type', 'application/json');
 
   if (req.method === 'OPTIONS') {
@@ -50,50 +48,28 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Приложение сообщает о выходе из аккаунта
-  if (req.method === 'POST' && req.url === '/unregister') {
-    let body = '';
-    req.on('data', d => body += d);
-    req.on('end', () => {
-      try {
-        const { client_id } = JSON.parse(body);
-        if (client_id && clients.has(client_id)) {
-          clients.delete(client_id);
-          console.log(`Unregistered: ${client_id} (total: ${clients.size})`);
-          res.end(JSON.stringify({ status: 'unregistered', client_id }));
-        } else {
-          res.end(JSON.stringify({ status: 'not_found', client_id }));
-        }
-      } catch (e) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-    return;
-  }
-
-  // n8n отправляет сюда вопросы и уведомления
   if (req.method === 'POST' && (req.url === '/question' || req.url === '/notification')) {
     let body = '';
     req.on('data', d => body += d);
     req.on('end', () => {
       try {
         const payload = JSON.parse(body);
-        let sent = 0;
+        let sentClients = [];
 
         if (payload.client_id) {
-          // → конкретному устройству
-          sent = sendToClientId(payload.client_id, payload);
+          sentClients = sendToClientId(payload.client_id, payload);
         } else if (payload.user_id != null) {
-          // → всем устройствам одного юзера
-          sent = sendToUserId(payload.user_id, payload);
+          sentClients = sendToUserId(payload.user_id, payload);
         } else {
-          // → broadcast всем
-          sent = sendToAll(payload);
+          sentClients = sendToAll(payload);
         }
 
-        console.log(`Sent to ${sent} client(s) [target: ${payload.client_id || payload.user_id || 'broadcast'}]`);
-        res.end(JSON.stringify({ status: 'sent', clients: sent }));
+        console.log(`Sent to ${sentClients.length} client(s) [target: ${payload.client_id || payload.user_id || 'broadcast'}]`);
+        res.end(JSON.stringify({
+          status: 'sent',
+          count: sentClients.length,
+          clients: sentClients
+        }));
       } catch (e) {
         res.writeHead(400);
         res.end(JSON.stringify({ error: e.message }));
@@ -109,7 +85,6 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', ws => {
-  // Временный ID до получения register
   const tempId = `tmp-${Date.now()}`;
   clients.set(tempId, { ws, clientId: null, userId: null });
   let currentKey = tempId;
@@ -120,20 +95,41 @@ wss.on('connection', ws => {
     try {
       const msg = JSON.parse(data.toString());
 
+      // Регистрация устройства
       if (msg.type === 'register') {
         const clientId = msg.client_id;
         const userId   = msg.user_id ?? null;
-
-        // Удаляем старый ключ
+      
+        // Проверка на null/undefined
+        if (!clientId) {
+          console.error('Register failed: client_id is missing');
+          ws.send(JSON.stringify({ type: 'error', message: 'client_id is required' }));
+          return;
+        }
+      
         clients.delete(currentKey);
         currentKey = clientId;
         clients.set(clientId, { ws, clientId, userId });
-
+      
         console.log(`Registered: client_id=${clientId} user_id=${userId} (total: ${clients.size})`);
         ws.send(JSON.stringify({ type: 'registered', client_id: clientId, user_id: userId }));
         return;
       }
 
+      // Отмена регистрации
+      if (msg.type === 'unregister') {
+        const clientId = msg.client_id;
+        if (clients.has(clientId)) {
+          clients.delete(clientId);
+          currentKey = `tmp-${Date.now()}`;
+          clients.set(currentKey, { ws, clientId: null, userId: null });
+          console.log(`Unregistered: client_id=${clientId} (total: ${clients.size})`);
+          ws.send(JSON.stringify({ type: 'unregistered', client_id: clientId }));
+        }
+        return;
+      }
+
+      // Ответ на вопрос
       if (msg.type === 'answer' && msg.callback_url) {
         console.log(`Answer "${msg.answer}" → ${msg.callback_url}`);
         try {
@@ -144,14 +140,14 @@ wss.on('connection', ws => {
           });
           const text = await r.text();
           console.log(`n8n response: ${r.status} — ${text}`);
-          ws.send(JSON.stringify({ type: 'ack', id: msg.id, status: r.status, body: text }));
-        } catch (fetchErr) {
-          console.error(`Fetch error: ${fetchErr.message}`);
-          ws.send(JSON.stringify({ type: 'ack', id: msg.id, error: fetchErr.message }));
+        } catch (err) {
+          console.error('Fetch error:', err.message);
         }
+        return;
       }
+
     } catch (e) {
-      console.error('Message error:', e.message);
+      console.error('WS message error:', e.message);
     }
   });
 
@@ -164,4 +160,4 @@ wss.on('connection', ws => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Relay server listening on :${PORT}`));
+server.listen(PORT, () => console.log(`Relay server running on port ${PORT}`));
