@@ -50,6 +50,28 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Приложение сообщает о выходе из аккаунта
+  if (req.method === 'POST' && req.url === '/unregister') {
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', () => {
+      try {
+        const { client_id } = JSON.parse(body);
+        if (client_id && clients.has(client_id)) {
+          clients.delete(client_id);
+          console.log(`Unregistered: ${client_id} (total: ${clients.size})`);
+          res.end(JSON.stringify({ status: 'unregistered', client_id }));
+        } else {
+          res.end(JSON.stringify({ status: 'not_found', client_id }));
+        }
+      } catch (e) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
   // n8n отправляет сюда вопросы и уведомления
   if (req.method === 'POST' && (req.url === '/question' || req.url === '/notification')) {
     let body = '';
