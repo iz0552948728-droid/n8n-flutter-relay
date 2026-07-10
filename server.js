@@ -129,10 +129,19 @@ wss.on('connection', ws => {
           return;
         }
       
+        // Если по этому client_id уже есть другое живое соединение (например,
+        // клиент переподключился, не дождавшись закрытия старого сокета) —
+        // закрываем старое, чтобы оно не "осиротело" и не удалило потом
+        // из clients запись уже нового, актуального соединения.
+        const stale = clients.get(clientId);
+        if (stale && stale.ws !== ws && stale.ws.readyState === WebSocket.OPEN) {
+          try { stale.ws.close(); } catch (_) {}
+        }
+
         clients.delete(currentKey);
         currentKey = clientId;
         clients.set(clientId, { ws, clientId, userId });
-      
+
         console.log(`Registered: client_id=${clientId} user_id=${userId} (total: ${clients.size})`);
         ws.send(JSON.stringify({ type: 'registered', client_id: clientId, user_id: userId }));
         return;
@@ -141,7 +150,11 @@ wss.on('connection', ws => {
       // Отмена регистрации
       if (msg.type === 'unregister') {
         const clientId = msg.client_id;
-        if (clients.has(clientId)) {
+        const entry = clients.get(clientId);
+        // Снимаем регистрацию, только если это делает то же соединение,
+        // которое её создало — иначе можно случайно "разлогинить" чужую,
+        // более новую регистрацию по тому же client_id.
+        if (entry && entry.ws === ws) {
           clients.delete(clientId);
           currentKey = `tmp-${Date.now()}`;
           clients.set(currentKey, { ws, clientId: null, userId: null });
@@ -174,7 +187,13 @@ wss.on('connection', ws => {
   });
 
   ws.on('close', () => {
-    clients.delete(currentKey);
+    // Удаляем запись, только если она всё ещё указывает на это соединение —
+    // иначе можно случайно удалить более новую регистрацию с тем же ключом
+    // (см. комментарий в обработчике 'register').
+    const entry = clients.get(currentKey);
+    if (entry && entry.ws === ws) {
+      clients.delete(currentKey);
+    }
     console.log(`Disconnected: ${currentKey} (total: ${clients.size})`);
   });
 
