@@ -168,10 +168,15 @@ wss.on('connection', ws => {
       if (msg.type === 'answer' && msg.callback_url) {
         console.log(`Answer "${msg.answer}" → ${msg.callback_url}`);
         try {
+          // Пересылаем всё, кроме транспортных полей. Раньше здесь был
+          // фиксированный список (id, answer, dt, kt), и любой новый формат
+          // ответа молча терял свои поля по дороге — так пропал бы splits
+          // у разнесения кредитного платежа.
+          const { type, callback_url, ...answerPayload } = msg;
           const r = await fetch(msg.callback_url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: msg.id, answer: msg.answer, dt: msg.dt, kt: msg.kt }),
+            body: JSON.stringify(answerPayload),
           });
           const text = await r.text();
           console.log(`n8n response: ${r.status} — ${text}`);
