@@ -1,51 +1,101 @@
 const http = require('http');
+const crypto = require('crypto');
 const WebSocket = require('ws');
 
 // ─────────────────────────────────────────────────────────────────────────
 // Настройки через переменные окружения Render
-//   N8N_API_KEY        — ключ публичного API n8n (Settings → n8n API)
-//   N8N_BASE_URL       — по умолчанию https://babchin.app.n8n.cloud
-//   RELAY_KEY          — общий секрет для /exec/track (тот же в HTTP-ноде n8n)
+//   JWT_SECRET    — тот же секрет, что app_secrets.jwt_secret в базе (НОВОЕ, 12.10.2026)
+//   RELAY_KEY     — общий секрет для вызовов из n8n (заголовок X-Relay-Key)
+//   N8N_API_KEY   — ключ публичного API n8n (Settings → n8n API)
+//   N8N_BASE_URL  — по умолчанию https://babchin.app.n8n.cloud
 // ─────────────────────────────────────────────────────────────────────────
 const N8N_BASE_URL = (process.env.N8N_BASE_URL || 'https://babchin.app.n8n.cloud').replace(/\/+$/, '');
 const N8N_API_KEY = process.env.N8N_API_KEY;
 const RELAY_KEY = process.env.RELAY_KEY;
+const JWT_SECRET = process.env.JWT_SECRET;
 
 const WATCH_INTERVAL_MS = 30 * 1000;          // опрос n8n
 const WATCH_MAX_AGE_MS = 24 * 60 * 60 * 1000; // дольше суток не следим
 
-// client_id -> { ws, clientId, userId }
-const clients = new Map();
+// Ответы на вопросы relay пересылает только на адреса ожидания n8n — иначе
+// любой мог бы подсунуть приложению вопрос с чужим callback_url.
+const CALLBACK_PREFIX = `${N8N_BASE_URL}/webhook-waiting/`;
 
-function sendToAll(payload) {
-  let sentClients = [];
-  clients.forEach(({ ws, clientId, userId }) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(payload));
-      sentClients.push({ client_id: clientId, user_id: userId });
-    }
-  });
-  return sentClients;
+if (!JWT_SECRET) console.error('JWT_SECRET не задан — регистрация окон работать не будет');
+if (!RELAY_KEY) console.error('RELAY_KEY не задан — вызовы из n8n будут отклонены');
+
+// ─────────────────────────────────────────────────────────────────────────
+// Сессии (12.10.2026). Каждое окно приложения — своя сессия, sid из токена.
+// Окно регистрируется токеном; relay сам проверяет подпись и берёт из токена
+// sid и uid. Подделать чужой адрес, просто назвав его, больше нельзя.
+//
+// sid -> { ws, sid, userId }
+// ─────────────────────────────────────────────────────────────────────────
+const sessions = new Map();
+
+function verifyJwt(token) {
+  if (!JWT_SECRET || typeof token !== 'string') return null;
+  const [h, p, s] = token.split('.');
+  if (!h || !p || !s) return null;
+  const expected = crypto.createHmac('sha256', JWT_SECRET).update(`${h}.${p}`).digest('base64url');
+  const a = Buffer.from(s);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(p, 'base64url').toString('utf8'));
+  } catch (_) {
+    return null;
+  }
+  if (!payload || typeof payload !== 'object') return null;
+  if (!payload.exp || payload.exp <= Math.floor(Date.now() / 1000)) return null;
+  // Служебный токен очереди окном не бывает.
+  if (payload.service || !payload.sid || payload.uid == null) return null;
+  return { sid: String(payload.sid), userId: String(payload.uid) };
 }
 
-function sendToClientId(clientId, payload) {
-  const entry = clients.get(clientId);
+// В n8n «канала нет» обозначается -1; пустые значения тоже не адрес.
+function clean(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  return (s === '' || s === '-1' || s === 'null' || s === 'undefined') ? null : s;
+}
+
+function sendTo(entry, payload) {
   if (entry && entry.ws.readyState === WebSocket.OPEN) {
     entry.ws.send(JSON.stringify(payload));
-    return [{ client_id: entry.clientId, user_id: entry.userId }];
+    return [{ sid: entry.sid, user_id: entry.userId }];
   }
   return [];
 }
 
 function sendToUserId(userId, payload) {
-  let sentClients = [];
-  clients.forEach(({ ws, clientId, userId: uid }) => {
-    if (uid == userId && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(payload));
-      sentClients.push({ client_id: clientId, user_id: uid });
-    }
+  let sent = [];
+  sessions.forEach(entry => {
+    if (entry.userId === String(userId)) sent = sent.concat(sendTo(entry, payload));
   });
-  return sentClients;
+  return sent;
+}
+
+// Куда доставить: сначала окно, из которого начато действие (sid), — но только
+// если это окно того же пользователя. Окно закрыто или sid не указан — во все
+// окна пользователя. Широковещательной рассылки нет: сообщение без адреса — ошибка.
+function deliver(payload) {
+  const sid = clean(payload.sid);
+  const userId = clean(payload.user_id);
+  if (sid) {
+    const entry = sessions.get(sid);
+    if (entry && (userId == null || entry.userId === userId)) {
+      const sent = sendTo(entry, payload);
+      if (sent.length) return sent;
+    }
+  }
+  if (userId) return sendToUserId(userId, payload);
+  return [];
+}
+
+function relayKeyOk(req) {
+  return Boolean(RELAY_KEY) && req.headers['x-relay-key'] === RELAY_KEY;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -59,22 +109,16 @@ function sendToUserId(userId, payload) {
 // Записи живут только в памяти: при перезапуске relay они пропадают.
 // ─────────────────────────────────────────────────────────────────────────
 
-// execution_id -> { user_id, client_id, label, started }
+// execution_id -> { user_id, sid, label, started }
 const runs = new Map();
-
-// В n8n «канал не используется» обозначается -1; пустые значения тоже не адрес.
-function clean(v) {
-  if (v === null || v === undefined) return null;
-  const s = String(v).trim();
-  return (s === '' || s === '-1' || s === 'null' || s === 'undefined') ? null : s;
-}
 
 function trackExecution(body) {
   const id = clean(body.execution_id);
   if (!id) return false;
   runs.set(id, {
     user_id: clean(body.user_id),
-    client_id: clean(body.client_id),
+    // client_id — прежнее имя поля; в нём теперь тоже sid.
+    sid: clean(body.sid) || clean(body.client_id),
     label: body.label || 'выписки',
     started: Date.now(),
   });
@@ -89,21 +133,15 @@ function notifyCrash(id, run) {
   const text = `Обработка ${run.label}, запущенная в ${time}, прервалась из-за нехватки ресурсов сервера. ` +
                `Запустите её повторно — уже записанные операции не продублируются.`;
 
-  // Приложение: по конкретному устройству, иначе по пользователю.
-  // Широковещательной рассылки здесь нет намеренно: сообщение не должно
-  // уйти всем подключённым.
-  let sent = [];
-  if (run.client_id || run.user_id) {
-    const payload = {
-      type: 'notification',
-      kind: 'execution_crashed',
-      id: String(id),
-      message: text,
-      source: 'relay',
-    };
-    if (run.client_id) sent = sendToClientId(run.client_id, payload);
-    if (!sent.length && run.user_id) sent = sendToUserId(run.user_id, payload);
-  }
+  const sent = deliver({
+    type: 'notification',
+    kind: 'execution_crashed',
+    id: String(id),
+    message: text,
+    source: 'relay',
+    sid: run.sid,
+    user_id: run.user_id,
+  });
 
   console.log(`Execution ${id} crashed → app: ${sent.length}`);
   if (!sent.length) {
@@ -117,7 +155,6 @@ async function checkExecutions() {
     console.error('N8N_API_KEY не задан — сторож выполнений не работает');
     return;
   }
-
   for (const [id, run] of runs) {
     if (Date.now() - run.started > WATCH_MAX_AGE_MS) { runs.delete(id); continue; }
 
@@ -159,6 +196,11 @@ function readBody(req, cb) {
   req.on('end', () => cb(body));
 }
 
+function reply(res, code, obj) {
+  res.writeHead(code);
+  res.end(JSON.stringify(obj));
+}
+
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'application/json');
@@ -168,86 +210,83 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === 'GET' && req.url === '/health') {
-    res.end(JSON.stringify({ status: 'ok', connected_clients: clients.size, watched_executions: runs.size }));
+    reply(res, 200, { status: 'ok', sessions: sessions.size, watched_executions: runs.size });
+    return;
+  }
+
+  // Всё остальное по HTTP вызывает только n8n — с ключом.
+  if (req.method === 'POST' && !relayKeyOk(req)) {
+    reply(res, 403, { error: 'forbidden' });
     return;
   }
 
   // Регистрация выполнения n8n для наблюдения
   if (req.method === 'POST' && req.url === '/exec/track') {
-    if (!RELAY_KEY || req.headers['x-relay-key'] !== RELAY_KEY) {
-      res.writeHead(403); res.end(JSON.stringify({ error: 'forbidden' })); return;
-    }
     readBody(req, body => {
       try {
         const ok = trackExecution(JSON.parse(body));
-        if (!ok) { res.writeHead(400); res.end(JSON.stringify({ error: 'execution_id is required' })); return; }
-        res.end(JSON.stringify({ status: 'tracking', watching: runs.size }));
+        if (!ok) { reply(res, 400, { error: 'execution_id is required' }); return; }
+        reply(res, 200, { status: 'tracking', watching: runs.size });
       } catch (e) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: e.message }));
+        reply(res, 400, { error: e.message });
       }
     });
     return;
   }
 
-  // HTTP unregister — приложение сообщает о выходе
-  if (req.method === 'POST' && req.url === '/unregister') {
-    readBody(req, body => {
-      try {
-        const { client_id } = JSON.parse(body);
-        if (client_id && clients.has(client_id)) {
-          clients.delete(client_id);
-          console.log(`Unregistered (HTTP): ${client_id} (total: ${clients.size})`);
-          res.end(JSON.stringify({ status: 'unregistered', client_id }));
-        } else {
-          res.end(JSON.stringify({ status: 'not_found', client_id }));
-        }
-      } catch (e) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-    return;
-  }
-
+  // Вопрос или уведомление в приложение.
+  // Адрес: sid (окно) и/или user_id (все окна пользователя).
   if (req.method === 'POST' && (req.url === '/question' || req.url === '/notification')) {
     readBody(req, body => {
       try {
         const payload = JSON.parse(body);
-        let sentClients = [];
+        // Прежнее имя поля: n8n мог прислать sid под именем client_id.
+        if (!clean(payload.sid) && clean(payload.client_id)) payload.sid = payload.client_id;
+        delete payload.client_id;
 
-        if (payload.client_id) {
-          sentClients = sendToClientId(payload.client_id, payload);
-        } else if (payload.user_id != null) {
-          sentClients = sendToUserId(payload.user_id, payload);
-        } else {
-          sentClients = sendToAll(payload);
+        if (!clean(payload.sid) && !clean(payload.user_id)) {
+          reply(res, 400, { error: 'sid or user_id is required' });
+          return;
         }
-
-        console.log(`Sent to ${sentClients.length} client(s) [target: ${payload.client_id || payload.user_id || 'broadcast'}]`);
-        res.end(JSON.stringify({
-          status: 'sent',
-          count: sentClients.length,
-          clients: sentClients
-        }));
+        const sent = deliver(payload);
+        console.log(`Sent to ${sent.length} window(s) [sid: ${payload.sid || '-'}, user: ${payload.user_id || '-'}]`);
+        reply(res, 200, { status: 'sent', count: sent.length, sessions: sent });
       } catch (e) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: e.message }));
+        reply(res, 400, { error: e.message });
       }
     });
     return;
   }
 
-  res.writeHead(404);
-  res.end(JSON.stringify({ error: 'Not found' }));
+  // Сессия завершена на сервере (выход, блокировка) — закрываем её окно.
+  if (req.method === 'POST' && req.url === '/session/close') {
+    readBody(req, body => {
+      try {
+        const { sid, user_id } = JSON.parse(body);
+        let closed = 0;
+        sessions.forEach((entry, key) => {
+          if ((sid && key === String(sid)) || (user_id != null && entry.userId === String(user_id))) {
+            sessions.delete(key);
+            try { entry.ws.close(4001, 'session closed'); } catch (_) {}
+            closed++;
+          }
+        });
+        reply(res, 200, { status: 'closed', count: closed });
+      } catch (e) {
+        reply(res, 400, { error: e.message });
+      }
+    });
+    return;
+  }
+
+  reply(res, 404, { error: 'Not found' });
 });
 
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', ws => {
-  const tempId = `tmp-${Date.now()}`;
-  clients.set(tempId, { ws, clientId: null, userId: null });
-  let currentKey = tempId;
+  // Ключ этого соединения в sessions; null — окно ещё не зарегистрировалось.
+  let currentSid = null;
 
   ws.send(JSON.stringify({ type: 'connected' }));
 
@@ -255,61 +294,58 @@ wss.on('connection', ws => {
     try {
       const msg = JSON.parse(data.toString());
 
-      // Регистрация устройства
+      // Регистрация окна: { type: 'register', jwt }
       if (msg.type === 'register') {
-        const clientId = msg.client_id;
-        const userId   = msg.user_id ?? null;
-
-        // Проверка на null/undefined
-        if (!clientId) {
-          console.error('Register failed: client_id is missing');
-          ws.send(JSON.stringify({ type: 'error', message: 'client_id is required' }));
+        const who = verifyJwt(msg.jwt);
+        if (!who) {
+          ws.send(JSON.stringify({ type: 'error', code: 'unauthorized', message: 'token is invalid or expired' }));
           return;
         }
 
-        // Если по этому client_id уже есть другое живое соединение (например,
-        // клиент переподключился, не дождавшись закрытия старого сокета) —
-        // закрываем старое, чтобы оно не "осиротело" и не удалило потом
-        // из clients запись уже нового, актуального соединения.
-        const stale = clients.get(clientId);
+        // Окно перерегистрировалось новым токеном (перелогин) — старую запись снимаем.
+        if (currentSid && currentSid !== who.sid) {
+          const old = sessions.get(currentSid);
+          if (old && old.ws === ws) sessions.delete(currentSid);
+        }
+
+        // По этому sid уже есть другое живое соединение (окно переподключилось,
+        // не дождавшись закрытия старого сокета) — старое закрываем.
+        const stale = sessions.get(who.sid);
         if (stale && stale.ws !== ws && stale.ws.readyState === WebSocket.OPEN) {
           try { stale.ws.close(); } catch (_) {}
         }
 
-        clients.delete(currentKey);
-        currentKey = clientId;
-        clients.set(clientId, { ws, clientId, userId });
-
-        console.log(`Registered: client_id=${clientId} user_id=${userId} (total: ${clients.size})`);
-        ws.send(JSON.stringify({ type: 'registered', client_id: clientId, user_id: userId }));
+        currentSid = who.sid;
+        sessions.set(who.sid, { ws, sid: who.sid, userId: who.userId });
+        console.log(`Registered: sid=${who.sid} user_id=${who.userId} (total: ${sessions.size})`);
+        ws.send(JSON.stringify({ type: 'registered', sid: who.sid, user_id: Number(who.userId) }));
         return;
       }
 
-      // Отмена регистрации
+      // Отмена регистрации (выход): снимаем только свою запись.
       if (msg.type === 'unregister') {
-        const clientId = msg.client_id;
-        const entry = clients.get(clientId);
-        // Снимаем регистрацию, только если это делает то же соединение,
-        // которое её создало — иначе можно случайно "разлогинить" чужую,
-        // более новую регистрацию по тому же client_id.
-        if (entry && entry.ws === ws) {
-          clients.delete(clientId);
-          currentKey = `tmp-${Date.now()}`;
-          clients.set(currentKey, { ws, clientId: null, userId: null });
-          console.log(`Unregistered: client_id=${clientId} (total: ${clients.size})`);
-          ws.send(JSON.stringify({ type: 'unregistered', client_id: clientId }));
-        }
+        const entry = currentSid && sessions.get(currentSid);
+        if (entry && entry.ws === ws) sessions.delete(currentSid);
+        ws.send(JSON.stringify({ type: 'unregistered', sid: currentSid }));
+        console.log(`Unregistered: sid=${currentSid} (total: ${sessions.size})`);
+        currentSid = null;
         return;
       }
 
-      // Ответ на вопрос
+      // Ответ на вопрос — только от зарегистрированного окна и только в n8n.
       if (msg.type === 'answer' && msg.callback_url) {
+        if (!currentSid) {
+          ws.send(JSON.stringify({ type: 'error', code: 'unauthorized', message: 'register first' }));
+          return;
+        }
+        if (!String(msg.callback_url).startsWith(CALLBACK_PREFIX)) {
+          console.error(`Answer rejected: callback_url ${msg.callback_url} is not an n8n resume URL`);
+          return;
+        }
         console.log(`Answer "${msg.answer}" → ${msg.callback_url}`);
         try {
-          // Пересылаем всё, кроме транспортных полей. Раньше здесь был
-          // фиксированный список (id, answer, dt, kt), и любой новый формат
-          // ответа молча терял свои поля по дороге — так пропал бы splits
-          // у разнесения кредитного платежа.
+          // Пересылаем всё, кроме транспортных полей: у разных ответов разные
+          // поля (answer, dt/kt, splits) — фиксированный список их терял.
           const { type, callback_url, ...answerPayload } = msg;
           const r = await fetch(msg.callback_url, {
             method: 'POST',
@@ -323,7 +359,6 @@ wss.on('connection', ws => {
         }
         return;
       }
-
     } catch (e) {
       console.error('WS message error:', e.message);
     }
@@ -331,16 +366,13 @@ wss.on('connection', ws => {
 
   ws.on('close', () => {
     // Удаляем запись, только если она всё ещё указывает на это соединение —
-    // иначе можно случайно удалить более новую регистрацию с тем же ключом
-    // (см. комментарий в обработчике 'register').
-    const entry = clients.get(currentKey);
-    if (entry && entry.ws === ws) {
-      clients.delete(currentKey);
-    }
-    console.log(`Disconnected: ${currentKey} (total: ${clients.size})`);
+    // иначе можно удалить более новую регистрацию того же окна.
+    const entry = currentSid && sessions.get(currentSid);
+    if (entry && entry.ws === ws) sessions.delete(currentSid);
+    console.log(`Disconnected: ${currentSid || 'unregistered'} (total: ${sessions.size})`);
   });
 
-  ws.on('error', err => console.error(`WS error ${currentKey}:`, err.message));
+  ws.on('error', err => console.error(`WS error ${currentSid || 'unregistered'}:`, err.message));
 });
 
 const PORT = process.env.PORT || 3000;
