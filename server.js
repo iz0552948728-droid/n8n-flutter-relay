@@ -217,6 +217,10 @@ const BODY_MAX_BYTES = 10 * 1024 * 1024;
 const QR_MAX_BYTES = 40 * 1024 * 1024;
 
 function readBody(req, cb, maxBytes = BODY_MAX_BYTES) {
+  readBytes(req, buf => cb(buf.toString('utf8')), maxBytes);
+}
+
+function readBytes(req, cb, maxBytes = BODY_MAX_BYTES) {
   const chunks = [];
   let size = 0;
   let tooBig = false;
@@ -232,7 +236,7 @@ function readBody(req, cb, maxBytes = BODY_MAX_BYTES) {
       req.relayRes.end(JSON.stringify({ error: 'body too large' }));
       return;
     }
-    cb(Buffer.concat(chunks).toString('utf8'));
+    cb(Buffer.concat(chunks));
   });
 }
 
@@ -314,14 +318,16 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // QR-код кассового чека (11.11.2026): Paul's 1 присылает фото в base64
-  // ({ data, mime }), relay возвращает тексты найденных QR-кодов ({ qr: [...] }).
-  // Не JPEG/PNG или кода нет — пустой список.
+  // QR-код кассового чека (11.11.2026): Paul's 1 присылает фото чека — файлом
+  // (тело запроса — сами байты) или JSON { data: base64 }. relay возвращает тексты
+  // найденных QR-кодов ({ qr: [...] }). Не JPEG/PNG или кода нет — пустой список.
   if (req.method === 'POST' && req.url === '/qr/decode') {
-    readBody(req, async body => {
+    const isJson = String(req.headers['content-type'] || '').includes('json');
+    readBytes(req, async raw => {
       try {
-        const { data } = JSON.parse(body || '{}');
-        const buf = Buffer.from(String(data || ''), 'base64');
+        const buf = isJson
+          ? Buffer.from(String(JSON.parse(raw.toString('utf8') || '{}').data || ''), 'base64')
+          : raw;
         const started = Date.now();
         const { qr, engine } = buf.length ? await decodeQr(buf) : { qr: [], engine: '' };
         console.log(`QR: ${qr.length} code(s) ${engine}, ${Math.round(buf.length / 1024)} KB, ${Date.now() - started} ms`);
