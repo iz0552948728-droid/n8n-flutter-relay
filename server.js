@@ -1,6 +1,7 @@
 const http = require('http');
 const crypto = require('crypto');
 const WebSocket = require('ws');
+const { decodeQr, wechatAvailable } = require('./qr');
 
 // ─────────────────────────────────────────────────────────────────────────
 // Настройки через переменные окружения Render
@@ -211,10 +212,32 @@ setInterval(async () => {
 // ─────────────────────────────────────────────────────────────────────────
 // HTTP
 // ─────────────────────────────────────────────────────────────────────────
-function readBody(req, cb) {
-  let body = '';
-  req.on('data', d => body += d);
-  req.on('end', () => cb(body));
+// Фото чека в base64 — несколько мегабайт; остальные запросы маленькие.
+const BODY_MAX_BYTES = 10 * 1024 * 1024;
+const QR_MAX_BYTES = 40 * 1024 * 1024;
+
+function readBody(req, cb, maxBytes = BODY_MAX_BYTES) {
+  readBytes(req, buf => cb(buf.toString('utf8')), maxBytes);
+}
+
+function readBytes(req, cb, maxBytes = BODY_MAX_BYTES) {
+  const chunks = [];
+  let size = 0;
+  let tooBig = false;
+  req.on('data', d => {
+    if (tooBig) return;
+    size += d.length;
+    if (size > maxBytes) { tooBig = true; return; }
+    chunks.push(d);
+  });
+  req.on('end', () => {
+    if (tooBig) {
+      req.relayRes.writeHead(413);
+      req.relayRes.end(JSON.stringify({ error: 'body too large' }));
+      return;
+    }
+    cb(Buffer.concat(chunks));
+  });
 }
 
 function reply(res, code, obj) {
@@ -223,6 +246,7 @@ function reply(res, code, obj) {
 }
 
 const server = http.createServer((req, res) => {
+  req.relayRes = res; // readBody отвечает 413 на слишком большой запрос
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'application/json');
 
@@ -231,7 +255,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === 'GET' && req.url === '/health') {
-    reply(res, 200, { status: 'ok', sessions: sessions.size, watched_executions: runs.size });
+    reply(res, 200, { status: 'ok', sessions: sessions.size, watched_executions: runs.size, qr_wechat: wechatAvailable() });
     return;
   }
 
@@ -291,6 +315,28 @@ const server = http.createServer((req, res) => {
         reply(res, 400, { error: e.message });
       }
     });
+    return;
+  }
+
+  // QR-код кассового чека (11.11.2026): Paul's 1 присылает фото чека — файлом
+  // (тело запроса — сами байты) или JSON { data: base64 }. relay возвращает тексты
+  // найденных QR-кодов ({ qr: [...] }). Не JPEG/PNG или кода нет — пустой список.
+  if (req.method === 'POST' && req.url === '/qr/decode') {
+    const isJson = String(req.headers['content-type'] || '').includes('json');
+    readBytes(req, async raw => {
+      try {
+        const buf = isJson
+          ? Buffer.from(String(JSON.parse(raw.toString('utf8') || '{}').data || ''), 'base64')
+          : raw;
+        const started = Date.now();
+        const { qr, engine } = buf.length ? await decodeQr(buf) : { qr: [], engine: '' };
+        console.log(`QR: ${qr.length} code(s) ${engine}, ${Math.round(buf.length / 1024)} KB, ${Date.now() - started} ms`);
+        reply(res, 200, { qr, engine });
+      } catch (e) {
+        console.error('QR decode error:', e.message);
+        reply(res, 200, { qr: [], error: e.message });
+      }
+    }, QR_MAX_BYTES);
     return;
   }
 
