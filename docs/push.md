@@ -33,38 +33,35 @@ Relay будит приложение, пока оно открыто. Push ну
 
 Push отправляется без ожидания результата.
 
-## Что нужно сделать вручную
+## Настройка n8n (сделано 10.11.2026)
 
-1. **Опубликовать** черновики Register/login и Question exe. Правки сохранены, но в работе пока прежние версии. Порядок важен: сначала Register/login.
+1. Register/login, Question exe и Push send опубликованы.
 2. **Ключ Firebase.** Firebase Console → `buh-app` → Project settings → Service accounts → Generate new private key. В n8n открыть узел `Send FCM` в Push send и создать credential **Google Service Account API**: email и private key из JSON. Включить «Set up for use in HTTP Request node», scope `https://www.googleapis.com/auth/firebase.messaging`. Ключ хранить только в credential.
 3. Удалить одноразовый воркфлоу `Push setup SQL` (`BqqCtPiZYQbnS21i`), он больше не нужен.
 
-## iPhone
+## iPhone: веб-версия с экрана «Домой»
 
-Сервер для iPhone готов. Нужно выбрать, в каком виде приложение будет на iPhone.
+Выбрана веб-версия (iOS 16.4 и новее, Apple Developer не нужен). Код в `accounting-app`, ветка `claude/tender-edison-v9o0r4`:
 
-**A. Нативное приложение (App Store / TestFlight).** Нужен Apple Developer Program ($99 в год) и Mac для сборки.
-1. developer.apple.com → Keys → создать ключ с Apple Push Notifications service (APNs), скачать `.p8`, записать Key ID и Team ID.
-2. Firebase → `buh-app` → Project settings → Cloud Messaging → Apple app configuration: загрузить `.p8`. Добавить iOS-приложение в проект и положить `GoogleService-Info.plist` в `ios/Runner`.
-3. Xcode → Runner → Signing & Capabilities: Push Notifications и Background Modes → Remote notifications.
-4. В приложении: `requestPermission()`, затем `getToken()`. На iOS токен появляется только после получения APNs-токена, поэтому сначала нужно дождаться `getAPNSToken()`. При входе слать `fcm_platform: "ios"`.
+- `lib/services/firebase_service.dart` — push на Android, iOS и вебе; токен при входе (`fcm_platform`), при выходе и смене пароля (`fcm_token`), смена токена — `type: push_token`;
+- `lib/widgets/push_banner.dart` — кнопка «Включить уведомления» (iPhone даёт спросить только по нажатию) и подсказка «добавьте на экран „Домой“» в Safari;
+- `web/firebase-messaging-sw.js` — показ push и открытие приложения по нажатию;
+- `.github/workflows/web-deploy.yml` — сборка веба и выкладка на Firebase Hosting: https://buh-app.web.app.
 
-**B. Веб-версия на экране «Домой».** Работает на iOS 16.4 и новее. Apple Developer не нужен.
-1. Firebase → Project settings → Cloud Messaging → Web Push certificates: сгенерировать VAPID-ключ.
-2. В `web/` положить `firebase-messaging-sw.js`, в `manifest.json` должно быть `"display": "standalone"`.
-3. Разрешение на уведомления запрашивать только по нажатию кнопки: iOS не даёт спросить при запуске. Затем вызвать `getToken(vapidKey: ...)` и слать `fcm_platform: "web"`.
-4. Push приходит, только если сайт добавлен на экран «Домой» через «Поделиться → На экран „Домой“». В Safari push не работает.
+Чтобы заработало:
 
-## Правки в приложении (для любой платформы)
-
-- `login`: `fcm_token` уже отправляется; добавить `fcm_platform`.
-- `logout`: добавить `fcm_token`.
-- `update-password`: добавить `fcm_token`.
-- `onTokenRefresh` → `type: "push_token"` с `jwt`, новым `fcm_token`, `old_fcm_token`, `fcm_platform`.
+1. Firebase Console → `buh-app` → Project settings → General: веб-приложение (`</>`), если его нет — добавить. Из его настроек взять `apiKey`, `appId`, `messagingSenderId`.
+2. Там же → Cloud Messaging → Web Push certificates → Generate key pair — VAPID-ключ.
+3. Firebase Console → Hosting → Get started (включить, команды не нужны).
+4. GitHub `accounting-app` → Settings → Secrets and variables → Actions:
+   - Variables: `FIREBASE_WEB_API_KEY`, `FIREBASE_WEB_APP_ID`, `FIREBASE_SENDER_ID`, `FIREBASE_VAPID_KEY`;
+   - Secret: `FIREBASE_SERVICE_ACCOUNT` — JSON ключа сервисного аккаунта. Можно тот же, что в n8n, добавив ему в Google Cloud → IAM роли Firebase Hosting Admin и API Keys Viewer.
+5. Слить ветку в `main` — сборка выложит веб сама.
 
 ## Проверка
 
-- [ ] Войти с телефона: в `push_tokens` появилась строка с нужными `user_id` и `platform`.
+- [ ] iPhone: открыть https://buh-app.web.app в Safari → «Поделиться» → «На экран „Домой“», запустить с иконки, войти, нажать «Включить» на плашке. В `push_tokens` появилась строка с `platform = web`.
+- [ ] Android: войти — строка с `platform = android`.
 - [ ] Загрузить документ, по которому будет вопрос, и закрыть приложение: push пришёл.
 - [ ] Через 15 минут без ответа: push пришёл администратору.
 - [ ] Выйти из аккаунта: строка из `push_tokens` исчезла.
