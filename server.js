@@ -29,9 +29,30 @@ if (!RELAY_KEY) console.error('RELAY_KEY не задан — вызовы из n
 // Окно регистрируется токеном; relay сам проверяет подпись и берёт из токена
 // sid и uid. Подделать чужой адрес, просто назвав его, больше нельзя.
 //
-// sid -> { ws, sid, userId }
+// sid -> { ws, sid, userId, fcmToken, visible, seenAt }
+//
+// fcmToken / visible / seenAt (11.11.2026) — присутствие для push: окно
+// сообщает, видно ли оно на экране и какой у устройства push-токен
+// ({ type: 'presence' }). Push send спрашивает POST /push/active и не шлёт
+// push туда, где приложение открыто: на iPhone веб-версия сама его не скрывает.
 // ─────────────────────────────────────────────────────────────────────────
 const sessions = new Map();
+
+// Окно на экране шлёт presence раз в 30 секунд; старше — уже не считаем.
+const PRESENCE_TTL_MS = 75 * 1000;
+
+function activePushTokens(tokens) {
+  const want = new Set((Array.isArray(tokens) ? tokens : []).map(String).filter(Boolean));
+  const now = Date.now();
+  const active = new Set();
+  sessions.forEach(entry => {
+    if (entry.fcmToken && want.has(entry.fcmToken) && entry.visible &&
+        entry.ws.readyState === WebSocket.OPEN && now - (entry.seenAt || 0) < PRESENCE_TTL_MS) {
+      active.add(entry.fcmToken);
+    }
+  });
+  return [...active];
+}
 
 function verifyJwt(token) {
   if (!JWT_SECRET || typeof token !== 'string') return null;
@@ -258,6 +279,21 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Push send (11.11.2026): какие из токенов сейчас у открытого на экране окна —
+  // туда push не нужен, вопрос и так всплывёт в приложении.
+  if (req.method === 'POST' && req.url === '/push/active') {
+    readBody(req, body => {
+      try {
+        const { tokens } = JSON.parse(body || '{}');
+        const active = activePushTokens(tokens);
+        reply(res, 200, { active });
+      } catch (e) {
+        reply(res, 400, { error: e.message });
+      }
+    });
+    return;
+  }
+
   // Сессия завершена на сервере (выход, блокировка) — закрываем её окно.
   if (req.method === 'POST' && req.url === '/session/close') {
     readBody(req, body => {
@@ -302,6 +338,10 @@ wss.on('connection', ws => {
           return;
         }
 
+        // Присутствие этого соединения переживает перерегистрацию новым токеном.
+        const prev = currentSid && sessions.get(currentSid);
+        const keep = prev && prev.ws === ws ? prev : {};
+
         // Окно перерегистрировалось новым токеном (перелогин) — старую запись снимаем.
         if (currentSid && currentSid !== who.sid) {
           const old = sessions.get(currentSid);
@@ -316,9 +356,24 @@ wss.on('connection', ws => {
         }
 
         currentSid = who.sid;
-        sessions.set(who.sid, { ws, sid: who.sid, userId: who.userId });
+        sessions.set(who.sid, {
+          ws, sid: who.sid, userId: who.userId,
+          fcmToken: keep.fcmToken || null, visible: !!keep.visible, seenAt: keep.seenAt || 0,
+        });
         console.log(`Registered: sid=${who.sid} user_id=${who.userId} (total: ${sessions.size})`);
         ws.send(JSON.stringify({ type: 'registered', sid: who.sid, user_id: Number(who.userId) }));
+        return;
+      }
+
+      // Присутствие для push (11.11.2026): { type: 'presence', visible, fcm_token }.
+      if (msg.type === 'presence') {
+        const entry = currentSid && sessions.get(currentSid);
+        if (entry && entry.ws === ws) {
+          entry.visible = msg.visible === true;
+          const token = typeof msg.fcm_token === 'string' ? msg.fcm_token.trim() : '';
+          entry.fcmToken = token || null;
+          entry.seenAt = Date.now();
+        }
         return;
       }
 
