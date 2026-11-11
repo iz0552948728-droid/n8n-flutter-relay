@@ -1,7 +1,7 @@
 const http = require('http');
 const crypto = require('crypto');
 const WebSocket = require('ws');
-const { decodeQr, wechatAvailable } = require('./qr');
+const { decodeQr, wechatAvailable, splitByQr } = require('./qr');
 
 // ─────────────────────────────────────────────────────────────────────────
 // Настройки через переменные окружения Render
@@ -335,6 +335,23 @@ const server = http.createServer((req, res) => {
       } catch (e) {
         console.error('QR decode error:', e.message);
         reply(res, 200, { qr: [], error: e.message });
+      }
+    }, QR_MAX_BYTES);
+    return;
+  }
+
+  // Фото с несколькими чеками (11.11.2026): тело — сам файл фото. Ответ — найденные QR и вырезанные
+  // по ним чеки ({ parts: [{ jpeg: base64, box, qr }] }); меньше двух чеков по QR — parts пустой.
+  if (req.method === 'POST' && req.url === '/qr/split') {
+    readBytes(req, async raw => {
+      try {
+        const started = Date.now();
+        const r = raw.length ? await splitByQr(raw) : { qr: [], axis: '', parts: [], reason: 'пусто' };
+        console.log(`QR split: ${r.qr.length} code(s), ${r.parts.length} part(s) ${r.reason || ''}, ${Date.now() - started} ms`);
+        reply(res, 200, r);
+      } catch (e) {
+        console.error('QR split error:', e.message);
+        reply(res, 200, { qr: [], axis: '', parts: [], reason: e.message });
       }
     }, QR_MAX_BYTES);
     return;
