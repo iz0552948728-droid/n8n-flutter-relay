@@ -49,25 +49,30 @@ function decodeWechat(buf) {
 }
 
 function decodeWechatNow(buf) {
+  return runPython(WECHAT_SCRIPT, buf).then(list =>
+    (Array.isArray(list) ? list.map(String).filter(Boolean) : []));
+}
+
+// Фото → JSON от скрипта на Python (OpenCV); ошибка или таймаут — null.
+function runPython(script, buf) {
   return new Promise(resolve => {
     let out = '';
     let err = '';
-    const py = spawn('python3', [WECHAT_SCRIPT], {
+    const py = spawn('python3', [script], {
       env: { ...process.env, PYTHONPATH: PYDEPS },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     const timer = setTimeout(() => py.kill('SIGKILL'), WECHAT_TIMEOUT_MS);
     py.stdout.on('data', d => out += d);
     py.stderr.on('data', d => err += d);
-    py.on('error', e => { clearTimeout(timer); console.error('QR wechat:', e.message); resolve([]); });
+    py.on('error', e => { clearTimeout(timer); console.error('QR python:', e.message); resolve(null); });
     py.on('close', code => {
       clearTimeout(timer);
-      if (code !== 0) { console.error(`QR wechat exit ${code}: ${err.slice(-500)}`); resolve([]); return; }
+      if (code !== 0) { console.error(`QR python exit ${code}: ${err.slice(-500)}`); resolve(null); return; }
       try {
-        const list = JSON.parse(out);
-        resolve(Array.isArray(list) ? list.map(String).filter(Boolean) : []);
+        resolve(JSON.parse(out));
       } catch (_) {
-        resolve([]);
+        resolve(null);
       }
     });
     py.stdin.on('error', () => {});
@@ -98,4 +103,18 @@ async function decodeQr(buf) {
   return { qr: [...new Set(qr)], engine: qr.length ? 'wechat' : '' };
 }
 
-module.exports = { decodeQr, imageKind, wechatAvailable };
+const SPLIT_SCRIPT = path.join(__dirname, 'scripts', 'qr_split.py');
+
+// Фото с несколькими чеками → части по QR-кодам (11.11.2026, scripts/qr_split.py):
+// { qr: [{text, x, y, size}], axis, parts: [{jpeg: base64, box, qr}], reason }. Без OpenCV — не делим.
+async function splitByQr(buf) {
+  const none = (reason) => ({ qr: [], axis: '', parts: [], reason });
+  if (!imageKind(buf)) return none('не фото');
+  if (!wechatAvailable()) return none('нет OpenCV');
+  const run = wechatQueue.then(() => runPython(SPLIT_SCRIPT, buf));
+  wechatQueue = run.catch(() => {});
+  const r = await run;
+  return r && Array.isArray(r.parts) ? r : none('не удалось разобрать фото');
+}
+
+module.exports = { decodeQr, imageKind, wechatAvailable, splitByQr };
