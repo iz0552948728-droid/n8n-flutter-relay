@@ -5,6 +5,10 @@
 # второго чека на целом фото не находится (фото 11.11.2026, два чека рядом). Чеков — по числу разных
 # фискальных QR (fn, i, fp). Делим по полосе без текста между соседними QR: чеки лежат рядом (по x)
 # или друг под другом (по y). Полосы нет — не делим: parts пустой, reason — почему.
+#
+# 12.11.2026: аргумент n — сколько чеков на фото по данным приложения (QR прочитаны камерой при съёмке).
+# Тогда прочитать QR на фото не обязательно: достаточно НАЙТИ n квадратов QR (детектор Aruco из OpenCV
+# находит их и там, где прочитать нельзя — размытые QR «Белорусского дворика», 12.11.2026).
 import base64
 import json
 import sys
@@ -63,7 +67,33 @@ def detect(img):
     return list(found.values())
 
 
-def split(img, codes):
+def locate(img):
+    """Где на фото QR-коды, без чтения: центр и размер. Несколько масштабов, совпадающие — один."""
+    h, w = img.shape[:2]
+    det = cv2.QRCodeDetectorAruco()
+    spots = []
+    for limit in (2000, 1400, 1000):
+        k = min(1.0, limit / max(h, w))
+        small = cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_AREA) if k < 1 else img
+        try:
+            ok, pts = det.detectMulti(small)
+        except cv2.error:
+            ok, pts = False, None
+        if not ok or pts is None:
+            continue
+        for p in pts:
+            p = p / k
+            c = p.mean(axis=0)
+            size = float(max(np.ptp(p[:, 0]), np.ptp(p[:, 1])))
+            if size < 40:
+                continue
+            if any(abs(c[0] - s['x']) < 0.6 * max(size, s['size']) and abs(c[1] - s['y']) < 0.6 * max(size, s['size']) for s in spots):
+                continue
+            spots.append({'text': '', 'x': int(c[0]), 'y': int(c[1]), 'size': int(size)})
+    return spots
+
+
+def split(img, codes, sure=False):
     """Границы между чеками: середина самой «пустой» полосы между соседними QR."""
     h, w = img.shape[:2]
     xs = [c['x'] for c in codes]
@@ -84,7 +114,9 @@ def split(img, codes):
         seg = prof[lo:hi]
         k = int(np.argmin(seg))
         busy = float(np.median(prof[int(min(a[axis], b[axis])):int(max(a[axis], b[axis]))]))
-        if seg[k] > 0.35 * busy:
+        # Число чеков знаем от приложения (sure) — режем по самому пустому месту, даже если чеки
+        # лежат почти вплотную (фото «Белорусского дворика», 12.11.2026). Иначе — только по пустой полосе.
+        if seg[k] > (0.85 if sure else 0.35) * busy:
             return axis, [], 'между чеками нет пустой полосы'
         # Середина пустой полосы вокруг минимума.
         thr = seg[k] + 0.1 * (busy - seg[k])
@@ -114,6 +146,10 @@ def encode_parts(img, boxes):
 
 
 def main():
+    try:
+        expected = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    except ValueError:
+        expected = 0
     data = np.frombuffer(sys.stdin.buffer.read(), dtype=np.uint8)
     # Ищем по серому кадру: втрое меньше памяти, чем цветной (у relay на Render 512 МБ, цветной 12 Мп
     # с частями кадра доходил до 600 МБ — relay падал, n8n получал 502). Цветной — только чтобы вырезать чеки.
@@ -129,10 +165,22 @@ def main():
             f = fiscal(c['text'])
             if f and f not in receipts:
                 receipts[f] = c
-        if len(receipts) < 2:
+        chosen = list(receipts.values())
+        if expected >= 2 and len(chosen) < expected:
+            # Приложение знает, что чеков n: добираем ненайденные декодером QR по месту на фото.
+            spots = list(chosen)
+            for s in locate(img):
+                if not any(abs(s['x'] - c['x']) < 0.6 * max(s['size'], c['size']) and abs(s['y'] - c['y']) < 0.6 * max(s['size'], c['size']) for c in spots):
+                    spots.append(s)
+            out['located'] = len(spots)
+            if len(spots) == expected:
+                chosen = spots
+        if len(chosen) < 2:
             out['reason'] = 'чеков по QR меньше двух'
+        elif expected >= 2 and len(chosen) != expected:
+            out['reason'] = f'QR на фото {len(chosen)}, а чеков {expected}'
         else:
-            out['axis'], cuts, out['reason'] = split(img, list(receipts.values()))
+            out['axis'], cuts, out['reason'] = split(img, chosen, sure=expected >= 2)
             if cuts:
                 del img
                 color = cv2.imdecode(data, cv2.IMREAD_COLOR)

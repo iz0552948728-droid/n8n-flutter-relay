@@ -342,12 +342,14 @@ const server = http.createServer((req, res) => {
 
   // Фото с несколькими чеками (11.11.2026): тело — сам файл фото. Ответ — найденные QR и вырезанные
   // по ним чеки ({ parts: [{ jpeg: base64, box, qr }] }); меньше двух чеков по QR — parts пустой.
-  if (req.method === 'POST' && req.url === '/qr/split') {
+  // ?n=2 — сколько чеков на фото по данным приложения: тогда QR достаточно найти, читать не обязательно.
+  if (req.method === 'POST' && (req.url === '/qr/split' || req.url.startsWith('/qr/split?'))) {
+    const expected = Number(new URL(req.url, 'http://relay').searchParams.get('n')) || 0;
     readBytes(req, async raw => {
       try {
         const started = Date.now();
-        const r = raw.length ? await splitByQr(raw) : { qr: [], axis: '', parts: [], reason: 'пусто' };
-        console.log(`QR split: ${r.qr.length} code(s), ${r.parts.length} part(s) ${r.reason || ''}, ${Date.now() - started} ms`);
+        const r = raw.length ? await splitByQr(raw, expected) : { qr: [], axis: '', parts: [], reason: 'пусто' };
+        console.log(`QR split: n=${expected}, ${r.qr.length} code(s), ${r.parts.length} part(s) ${r.reason || ''}, ${Date.now() - started} ms`);
         reply(res, 200, r);
       } catch (e) {
         console.error('QR split error:', e.message);
