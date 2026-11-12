@@ -12,6 +12,7 @@
 import base64
 import json
 import sys
+import time
 
 import cv2
 import numpy as np
@@ -28,7 +29,11 @@ def fiscal(text):
     return None
 
 
-def detect(img):
+def detect(img, expected=0, budget=20.0):
+    """Читаем QR. Число чеков от приложения известно — только целый кадр: остальное найдёт locate()
+    без чтения. Иначе ещё части кадра, но не дольше budget секунд: на Render процессор слабый, перебор
+    частей там шёл дольше 30 с и relay обрывал работу (прогон 34219, 12.11.2026)."""
+    started = time.time()
     det = cv2.wechat_qrcode_WeChatQRCode()
     h, w = img.shape[:2]
     found = {}
@@ -56,13 +61,15 @@ def detect(img):
     run(0, 0, w, h, 2000)
     # Сетки от крупной к мелкой; нашлось два чека и больше — дальше не ищем (каждый проход ~1 с на тайл).
     for nx, ny in [(2, 1), (1, 2), (2, 2), (3, 2), (2, 3)]:
-        if receipts() >= 2:
+        if receipts() >= 2 or expected >= 2 or time.time() - started > budget:
             break
         tw, th = min(w, int(w / nx * 1.3)), min(h, int(h / ny * 1.3))
         for i in range(nx):
             for j in range(ny):
                 x0 = max(0, min(w - tw, int(i * w / nx - 0.15 * w / nx)))
                 y0 = max(0, min(h - th, int(j * h / ny - 0.15 * h / ny)))
+                if time.time() - started > budget:
+                    break
                 run(x0, y0, tw, th, 1600)
     return list(found.values())
 
@@ -158,7 +165,7 @@ def main():
     if img is None:
         out['reason'] = 'не фото'
     else:
-        codes = detect(img)
+        codes = detect(img, expected)
         out['qr'] = codes
         receipts = {}
         for c in codes:

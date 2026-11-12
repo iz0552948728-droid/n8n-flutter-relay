@@ -30,7 +30,8 @@ function imageKind(buf) {
 
 const PYDEPS = path.join(__dirname, '.pydeps');
 const WECHAT_SCRIPT = path.join(__dirname, 'scripts', 'qr_wechat.py');
-const WECHAT_TIMEOUT_MS = 30 * 1000;
+// Render: слабый процессор — поиск по частям кадра там в разы дольше, чем на компьютере.
+const WECHAT_TIMEOUT_MS = 75 * 1000;
 
 // Есть ли OpenCV: проверяем один раз (для /health и чтобы не запускать зря).
 let wechatReady = null;
