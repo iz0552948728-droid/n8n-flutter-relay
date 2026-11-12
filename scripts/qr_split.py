@@ -48,7 +48,8 @@ def detect(img):
     def receipts():
         return len({fiscal(t) for t in found if fiscal(t)})
 
-    run(0, 0, w, h)
+    # Целый кадр — не крупнее 2000 px: на полном 12 Мп декодер без находки съедает ~500 МБ (11.11.2026).
+    run(0, 0, w, h, 2000)
     # Сетки от крупной к мелкой; нашлось два чека и больше — дальше не ищем (каждый проход ~1 с на тайл).
     for nx, ny in [(2, 1), (1, 2), (2, 2), (3, 2), (2, 3)]:
         if receipts() >= 2:
@@ -69,8 +70,7 @@ def split(img, codes):
     ys = [c['y'] for c in codes]
     axis = 'x' if np.ptp(xs) >= np.ptp(ys) else 'y'
     codes = sorted(codes, key=lambda c: c[axis])
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    ink = cv2.adaptiveThreshold(gray, 1, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 15)
+    ink = cv2.adaptiveThreshold(img, 1, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 15)
     prof = ink.mean(axis=0 if axis == 'x' else 1).astype(float)
     win = max(5, int(len(prof) * 0.01))
     prof = np.convolve(prof, np.ones(win) / win, mode='same')
@@ -96,21 +96,28 @@ def split(img, codes):
             r += 1
         cuts.append(lo + (l + r) // 2)
     edges = [0] + cuts + [w if axis == 'x' else h]
-    parts = []
+    boxes = []
     for i, c in enumerate(codes):
         a0, a1 = edges[i], edges[i + 1]
-        box = [a0, 0, a1, h] if axis == 'x' else [0, a0, w, a1]
+        boxes.append(([a0, 0, a1, h] if axis == 'x' else [0, a0, w, a1], c['text']))
+    return axis, boxes, ''
+
+
+def encode_parts(img, boxes):
+    parts = []
+    for box, text in boxes:
         crop = img[box[1]:box[3], box[0]:box[2]]
         ok, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        if not ok:
-            return axis, [], 'не удалось сохранить часть'
-        parts.append({'jpeg': base64.b64encode(buf.tobytes()).decode(), 'box': box, 'qr': c['text']})
-    return axis, parts, ''
+        if ok:
+            parts.append({'jpeg': base64.b64encode(buf.tobytes()).decode(), 'box': box, 'qr': text})
+    return parts if len(parts) == len(boxes) else []
 
 
 def main():
     data = np.frombuffer(sys.stdin.buffer.read(), dtype=np.uint8)
-    img = cv2.imdecode(data, cv2.IMREAD_COLOR)  # с учётом поворота из EXIF
+    # Ищем по серому кадру: втрое меньше памяти, чем цветной (у relay на Render 512 МБ, цветной 12 Мп
+    # с частями кадра доходил до 600 МБ — relay падал, n8n получал 502). Цветной — только чтобы вырезать чеки.
+    img = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)  # с учётом поворота из EXIF
     out = {'qr': [], 'axis': '', 'parts': [], 'reason': ''}
     if img is None:
         out['reason'] = 'не фото'
@@ -125,7 +132,11 @@ def main():
         if len(receipts) < 2:
             out['reason'] = 'чеков по QR меньше двух'
         else:
-            out['axis'], out['parts'], out['reason'] = split(img, list(receipts.values()))
+            out['axis'], cuts, out['reason'] = split(img, list(receipts.values()))
+            if cuts:
+                del img
+                color = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                out['parts'] = encode_parts(color, cuts)
     print(json.dumps(out, ensure_ascii=False))
 
 
